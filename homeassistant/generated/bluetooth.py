@@ -155,12 +155,22 @@ BLUETOOTH: Final[list[dict[str, bool | str | int | list[int]]]] = [
     {
         "connectable": False,
         "domain": "govee_ble",
+        "local_name": "GV5124*",
+    },
+    {
+        "connectable": False,
+        "domain": "govee_ble",
         "local_name": "GV5125*",
     },
     {
         "connectable": False,
         "domain": "govee_ble",
         "local_name": "GV5126*",
+    },
+    {
+        "connectable": False,
+        "domain": "govee_ble",
+        "local_name": "GVH5127*",
     },
     {
         "connectable": False,
@@ -252,11 +262,27 @@ BLUETOOTH: Final[list[dict[str, bool | str | int | list[int]]]] = [
         "manufacturer_id": 61320,
     },
     {
+        "connectable": False,
+        "domain": "govee_ble",
+        "manufacturer_data_start": [
+            236,
+            0,
+            0,
+            1,
+        ],
+        "manufacturer_id": 34819,
+    },
+    {
         "domain": "homekit_controller",
         "manufacturer_data_start": [
             6,
         ],
         "manufacturer_id": 76,
+    },
+    {
+        "connectable": True,
+        "domain": "husqvarna_automower_ble",
+        "service_uuid": "98bd0001-0b0e-421a-84e5-ddbf75dc6de4",
     },
     {
         "domain": "ibeacon",
@@ -299,6 +325,11 @@ BLUETOOTH: Final[list[dict[str, bool | str | int | list[int]]]] = [
         "connectable": False,
         "domain": "inkbird",
         "local_name": "tps",
+    },
+    {
+        "connectable": True,
+        "domain": "iron_os",
+        "service_uuid": "9eae1000-9d0d-48c5-aa55-33e27f9bc533",
     },
     {
         "connectable": False,
