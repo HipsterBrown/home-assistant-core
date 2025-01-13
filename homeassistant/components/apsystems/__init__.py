@@ -13,7 +13,12 @@ from homeassistant.core import HomeAssistant
 from .const import DEFAULT_PORT
 from .coordinator import ApSystemsDataCoordinator
 
-PLATFORMS: list[Platform] = [Platform.NUMBER, Platform.SENSOR]
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.NUMBER,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
 
 
 @dataclass
@@ -33,6 +38,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ApSystemsConfigEntry) ->
         ip_address=entry.data[CONF_IP_ADDRESS],
         port=entry.data.get(CONF_PORT, DEFAULT_PORT),
         timeout=8,
+        enable_debounce=True,
     )
     coordinator = ApSystemsDataCoordinator(hass, api)
     await coordinator.async_config_entry_first_refresh()

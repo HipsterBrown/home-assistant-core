@@ -1,10 +1,17 @@
 """Test the Tesla Fleet init."""
 
+from copy import deepcopy
+from unittest.mock import AsyncMock, patch
+
+from aiohttp import RequestInfo
+from aiohttp.client_exceptions import ClientResponseError
 from freezegun.api import FrozenDateTimeFactory
 import pytest
-from syrupy import SnapshotAssertion
+from syrupy.assertion import SnapshotAssertion
 from tesla_fleet_api.exceptions import (
+    InvalidRegion,
     InvalidToken,
+    LibraryError,
     LoginRequired,
     OAuthExpired,
     RateLimited,
@@ -12,6 +19,7 @@ from tesla_fleet_api.exceptions import (
     VehicleOffline,
 )
 
+from homeassistant.components.tesla_fleet.const import AUTHORIZE_URL
 from homeassistant.components.tesla_fleet.coordinator import (
     ENERGY_INTERVAL,
     ENERGY_INTERVAL_SECONDS,
@@ -22,6 +30,7 @@ from homeassistant.components.tesla_fleet.coordinator import (
 from homeassistant.components.tesla_fleet.models import TeslaFleetData
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import device_registry as dr
 
 from . import setup_platform
@@ -57,15 +66,59 @@ async def test_load_unload(
 async def test_init_error(
     hass: HomeAssistant,
     normal_config_entry: MockConfigEntry,
-    mock_products,
-    side_effect,
-    state,
+    mock_products: AsyncMock,
+    side_effect: TeslaFleetError,
+    state: ConfigEntryState,
 ) -> None:
     """Test init with errors."""
 
     mock_products.side_effect = side_effect
     await setup_platform(hass, normal_config_entry)
     assert normal_config_entry.state is state
+
+
+async def test_oauth_refresh_expired(
+    hass: HomeAssistant,
+    normal_config_entry: MockConfigEntry,
+    mock_products: AsyncMock,
+) -> None:
+    """Test init with expired Oauth token."""
+
+    # Patch the token refresh to raise an error
+    with patch(
+        "homeassistant.components.tesla_fleet.OAuth2Session.async_ensure_token_valid",
+        side_effect=ClientResponseError(
+            RequestInfo(AUTHORIZE_URL, "POST", {}, AUTHORIZE_URL), None, status=401
+        ),
+    ) as mock_async_ensure_token_valid:
+        # Trigger an unmocked function call
+        mock_products.side_effect = InvalidRegion
+        await setup_platform(hass, normal_config_entry)
+
+        mock_async_ensure_token_valid.assert_called_once()
+    assert normal_config_entry.state is ConfigEntryState.SETUP_ERROR
+
+
+async def test_oauth_refresh_error(
+    hass: HomeAssistant,
+    normal_config_entry: MockConfigEntry,
+    mock_products: AsyncMock,
+) -> None:
+    """Test init with Oauth refresh failure."""
+
+    # Patch the token refresh to raise an error
+    with patch(
+        "homeassistant.components.tesla_fleet.OAuth2Session.async_ensure_token_valid",
+        side_effect=ClientResponseError(
+            RequestInfo(AUTHORIZE_URL, "POST", {}, AUTHORIZE_URL), None, status=400
+        ),
+    ) as mock_async_ensure_token_valid:
+        # Trigger an unmocked function call
+        mock_products.side_effect = InvalidRegion
+        await setup_platform(hass, normal_config_entry)
+
+        mock_async_ensure_token_valid.assert_called_once()
+    assert normal_config_entry.state is ConfigEntryState.SETUP_RETRY
 
 
 # Test devices
@@ -89,8 +142,8 @@ async def test_devices(
 async def test_vehicle_refresh_offline(
     hass: HomeAssistant,
     normal_config_entry: MockConfigEntry,
-    mock_vehicle_state,
-    mock_vehicle_data,
+    mock_vehicle_state: AsyncMock,
+    mock_vehicle_data: AsyncMock,
     freezer: FrozenDateTimeFactory,
 ) -> None:
     """Test coordinator refresh with an error."""
@@ -102,18 +155,17 @@ async def test_vehicle_refresh_offline(
     mock_vehicle_state.reset_mock()
     mock_vehicle_data.reset_mock()
 
-    # Test the unlikely condition that a vehicle state is online but actually offline
+    # Then the vehicle goes offline
     mock_vehicle_data.side_effect = VehicleOffline
     freezer.tick(VEHICLE_INTERVAL)
     async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
-    mock_vehicle_state.assert_called_once()
+    mock_vehicle_state.assert_not_called()
     mock_vehicle_data.assert_called_once()
-    mock_vehicle_state.reset_mock()
     mock_vehicle_data.reset_mock()
 
-    # Test the normal condition that a vehcile state is offline
+    # And stays offline
     mock_vehicle_state.return_value = VEHICLE_ASLEEP
     freezer.tick(VEHICLE_INTERVAL)
     async_fire_time_changed(hass)
@@ -127,15 +179,15 @@ async def test_vehicle_refresh_offline(
 async def test_vehicle_refresh_error(
     hass: HomeAssistant,
     normal_config_entry: MockConfigEntry,
-    mock_vehicle_state,
-    side_effect,
+    mock_vehicle_data: AsyncMock,
+    side_effect: TeslaFleetError,
     freezer: FrozenDateTimeFactory,
 ) -> None:
     """Test coordinator refresh makes entity unavailable."""
 
     await setup_platform(hass, normal_config_entry)
 
-    mock_vehicle_state.side_effect = side_effect
+    mock_vehicle_data.side_effect = side_effect
     freezer.tick(VEHICLE_INTERVAL)
     async_fire_time_changed(hass)
     await hass.async_block_till_done()
@@ -147,7 +199,7 @@ async def test_vehicle_refresh_error(
 async def test_vehicle_refresh_ratelimited(
     hass: HomeAssistant,
     normal_config_entry: MockConfigEntry,
-    mock_vehicle_data,
+    mock_vehicle_data: AsyncMock,
     freezer: FrozenDateTimeFactory,
 ) -> None:
     """Test coordinator refresh handles 429."""
@@ -178,7 +230,7 @@ async def test_vehicle_refresh_ratelimited(
 async def test_vehicle_sleep(
     hass: HomeAssistant,
     normal_config_entry: MockConfigEntry,
-    mock_vehicle_data,
+    mock_vehicle_data: AsyncMock,
     freezer: FrozenDateTimeFactory,
 ) -> None:
     """Test coordinator refresh with an error."""
@@ -240,9 +292,9 @@ async def test_vehicle_sleep(
 async def test_energy_live_refresh_error(
     hass: HomeAssistant,
     normal_config_entry: MockConfigEntry,
-    mock_live_status,
-    side_effect,
-    state,
+    mock_live_status: AsyncMock,
+    side_effect: TeslaFleetError,
+    state: ConfigEntryState,
 ) -> None:
     """Test coordinator refresh with an error."""
     mock_live_status.side_effect = side_effect
@@ -255,9 +307,9 @@ async def test_energy_live_refresh_error(
 async def test_energy_site_refresh_error(
     hass: HomeAssistant,
     normal_config_entry: MockConfigEntry,
-    mock_site_info,
-    side_effect,
-    state,
+    mock_site_info: AsyncMock,
+    side_effect: TeslaFleetError,
+    state: ConfigEntryState,
 ) -> None:
     """Test coordinator refresh with an error."""
     mock_site_info.side_effect = side_effect
@@ -299,7 +351,7 @@ async def test_energy_live_refresh_ratelimited(
 async def test_energy_info_refresh_ratelimited(
     hass: HomeAssistant,
     normal_config_entry: MockConfigEntry,
-    mock_site_info,
+    mock_site_info: AsyncMock,
     freezer: FrozenDateTimeFactory,
 ) -> None:
     """Test coordinator refresh handles 429."""
@@ -325,3 +377,68 @@ async def test_energy_info_refresh_ratelimited(
     await hass.async_block_till_done()
 
     assert mock_site_info.call_count == 3
+
+
+async def test_init_region_issue(
+    hass: HomeAssistant,
+    normal_config_entry: MockConfigEntry,
+    mock_products: AsyncMock,
+    mock_find_server: AsyncMock,
+) -> None:
+    """Test init with region issue."""
+
+    mock_products.side_effect = InvalidRegion
+    await setup_platform(hass, normal_config_entry)
+    mock_find_server.assert_called_once()
+    assert normal_config_entry.state is ConfigEntryState.SETUP_RETRY
+
+
+async def test_init_region_issue_failed(
+    hass: HomeAssistant,
+    normal_config_entry: MockConfigEntry,
+    mock_products: AsyncMock,
+    mock_find_server: AsyncMock,
+) -> None:
+    """Test init with unresolvable region issue."""
+
+    mock_products.side_effect = InvalidRegion
+    mock_find_server.side_effect = LibraryError
+    await setup_platform(hass, normal_config_entry)
+    mock_find_server.assert_called_once()
+    assert normal_config_entry.state is ConfigEntryState.SETUP_ERROR
+
+
+async def test_signing(
+    hass: HomeAssistant,
+    normal_config_entry: MockConfigEntry,
+    mock_products: AsyncMock,
+) -> None:
+    """Tests when a vehicle requires signing."""
+
+    # Make the vehicle require command signing
+    products = deepcopy(mock_products.return_value)
+    products["response"][0]["command_signing"] = "required"
+    mock_products.return_value = products
+
+    with patch(
+        "homeassistant.components.tesla_fleet.TeslaFleetApi.get_private_key"
+    ) as mock_get_private_key:
+        await setup_platform(hass, normal_config_entry)
+        mock_get_private_key.assert_called_once()
+
+
+async def test_bad_implementation(
+    hass: HomeAssistant,
+    bad_config_entry: MockConfigEntry,
+) -> None:
+    """Test handling of a bad authentication implementation."""
+
+    await setup_platform(hass, bad_config_entry)
+    assert bad_config_entry.state is ConfigEntryState.SETUP_ERROR
+
+    # Ensure reauth flow starts
+    assert any(bad_config_entry.async_get_active_flows(hass, {"reauth"}))
+    result = await bad_config_entry.start_reauth_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+    assert not result["errors"]

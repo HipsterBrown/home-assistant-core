@@ -31,12 +31,20 @@ BINARY_SENSOR_DESCRIPTIONS = {
         key=GoveeBLEBinarySensorDeviceClass.WINDOW,
         device_class=BinarySensorDeviceClass.WINDOW,
     ),
+    GoveeBLEBinarySensorDeviceClass.MOTION: BinarySensorEntityDescription(
+        key=GoveeBLEBinarySensorDeviceClass.MOTION,
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
+    GoveeBLEBinarySensorDeviceClass.OCCUPANCY: BinarySensorEntityDescription(
+        key=GoveeBLEBinarySensorDeviceClass.OCCUPANCY,
+        device_class=BinarySensorDeviceClass.OCCUPANCY,
+    ),
 }
 
 
 def sensor_update_to_bluetooth_data_update(
     sensor_update: SensorUpdate,
-) -> PassiveBluetoothDataUpdate:
+) -> PassiveBluetoothDataUpdate[bool | None]:
     """Convert a sensor update to a bluetooth data update."""
     return PassiveBluetoothDataUpdate(
         devices={
@@ -87,13 +95,13 @@ class GoveeBluetoothBinarySensorEntity(
 ):
     """Representation of a govee-ble binary sensor."""
 
-    processor: GoveeBLEPassiveBluetoothDataProcessor
+    processor: GoveeBLEPassiveBluetoothDataProcessor[bool | None]
 
     @property
     def available(self) -> bool:
         """Return False if sensor is in error."""
         coordinator = self.processor.coordinator
-        return self.processor.entity_data.get(self.entity_key) != ERROR and (
+        return self.processor.entity_data.get(self.entity_key) != ERROR and (  # type: ignore[comparison-overlap]
             ((model_info := coordinator.model_info) and model_info.sleepy)
             or super().available
         )

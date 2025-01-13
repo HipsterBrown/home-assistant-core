@@ -34,7 +34,7 @@ from .entity import (
     async_setup_entry_rpc,
 )
 from .utils import (
-    async_remove_orphaned_virtual_entities,
+    async_remove_orphaned_entities,
     get_device_entry_gen,
     get_virtual_component_ids,
     is_block_momentary_input,
@@ -204,6 +204,15 @@ RPC_SENSORS: Final = {
         entity_category=EntityCategory.DIAGNOSTIC,
         supported=lambda status: status.get("apower") is not None,
     ),
+    "overcurrent": RpcBinarySensorDescription(
+        key="switch",
+        sub_key="errors",
+        name="Overcurrent",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        value=lambda status, _: False if status is None else "overcurrent" in status,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        supported=lambda status: status.get("apower") is not None,
+    ),
     "smoke": RpcBinarySensorDescription(
         key="smoke",
         sub_key="alarm",
@@ -254,13 +263,13 @@ async def async_setup_entry(
             virtual_binary_sensor_ids = get_virtual_component_ids(
                 coordinator.device.config, BINARY_SENSOR_PLATFORM
             )
-            async_remove_orphaned_virtual_entities(
+            async_remove_orphaned_entities(
                 hass,
                 config_entry.entry_id,
                 coordinator.mac,
                 BINARY_SENSOR_PLATFORM,
-                "boolean",
                 virtual_binary_sensor_ids,
+                "boolean",
             )
         return
 

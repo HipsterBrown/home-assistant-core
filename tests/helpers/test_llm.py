@@ -22,7 +22,6 @@ from homeassistant.helpers import (
     selector,
 )
 from homeassistant.setup import async_setup_component
-from homeassistant.util import yaml
 
 from tests.common import MockConfigEntry
 
@@ -40,6 +39,14 @@ def llm_context() -> llm.LLMContext:
     )
 
 
+class MyAPI(llm.API):
+    """Test API."""
+
+    async def async_get_api_instance(self, _: llm.ToolInput) -> llm.APIInstance:
+        """Return a list of tools."""
+        return llm.APIInstance(self, "", [], llm_context)
+
+
 async def test_get_api_no_existing(
     hass: HomeAssistant, llm_context: llm.LLMContext
 ) -> None:
@@ -51,11 +58,6 @@ async def test_get_api_no_existing(
 async def test_register_api(hass: HomeAssistant, llm_context: llm.LLMContext) -> None:
     """Test registering an llm api."""
 
-    class MyAPI(llm.API):
-        async def async_get_api_instance(self, _: llm.ToolInput) -> llm.APIInstance:
-            """Return a list of tools."""
-            return llm.APIInstance(self, "", [], llm_context)
-
     api = MyAPI(hass=hass, id="test", name="Test")
     llm.async_register_api(hass, api)
 
@@ -65,6 +67,59 @@ async def test_register_api(hass: HomeAssistant, llm_context: llm.LLMContext) ->
 
     with pytest.raises(HomeAssistantError):
         llm.async_register_api(hass, api)
+
+
+async def test_unregister_api(hass: HomeAssistant, llm_context: llm.LLMContext) -> None:
+    """Test unregistering an llm api."""
+
+    unreg = llm.async_register_api(hass, MyAPI(hass=hass, id="test", name="Test"))
+    assert await llm.async_get_api(hass, "test", llm_context)
+    unreg()
+    with pytest.raises(HomeAssistantError):
+        assert await llm.async_get_api(hass, "test", llm_context)
+
+
+async def test_reregister_api(hass: HomeAssistant, llm_context: llm.LLMContext) -> None:
+    """Test unregistering an llm api then re-registering with the same id."""
+
+    unreg = llm.async_register_api(hass, MyAPI(hass=hass, id="test", name="Test"))
+    assert await llm.async_get_api(hass, "test", llm_context)
+    unreg()
+    llm.async_register_api(hass, MyAPI(hass=hass, id="test", name="Test"))
+    assert await llm.async_get_api(hass, "test", llm_context)
+
+
+async def test_unregister_twice(
+    hass: HomeAssistant, llm_context: llm.LLMContext
+) -> None:
+    """Test unregistering an llm api twice."""
+
+    unreg = llm.async_register_api(hass, MyAPI(hass=hass, id="test", name="Test"))
+    assert await llm.async_get_api(hass, "test", llm_context)
+    unreg()
+
+    # Unregistering twice is a bug that should not happen
+    with pytest.raises(KeyError):
+        unreg()
+
+
+async def test_multiple_apis(hass: HomeAssistant, llm_context: llm.LLMContext) -> None:
+    """Test registering multiple APIs."""
+
+    unreg1 = llm.async_register_api(hass, MyAPI(hass=hass, id="test-1", name="Test 1"))
+    llm.async_register_api(hass, MyAPI(hass=hass, id="test-2", name="Test 2"))
+
+    # Verify both Apis are registered
+    assert await llm.async_get_api(hass, "test-1", llm_context)
+    assert await llm.async_get_api(hass, "test-2", llm_context)
+
+    # Unregister and verify only one is left
+    unreg1()
+
+    with pytest.raises(HomeAssistantError):
+        assert await llm.async_get_api(hass, "test-1", llm_context)
+
+    assert await llm.async_get_api(hass, "test-2", llm_context)
 
 
 async def test_call_tool_no_existing(
@@ -307,6 +362,7 @@ async def test_assist_api_tools(
         "HassSetPosition",
         "HassStartTimer",
         "HassCancelTimer",
+        "HassCancelAllTimers",
         "HassIncreaseTimer",
         "HassDecreaseTimer",
         "HassPauseTimer",
@@ -375,11 +431,16 @@ async def test_assist_api_prompt(
                         "beer": {"description": "Number of beers"},
                         "wine": {},
                     },
-                }
+                },
+                "script_with_no_fields": {
+                    "description": "This is another test script",
+                    "sequence": [],
+                },
             }
         },
     )
     async_expose_entity(hass, "conversation", "script.test_script", True)
+    async_expose_entity(hass, "conversation", "script.script_with_no_fields", True)
 
     entry = MockConfigEntry(title=None)
     entry.add_to_hass(hass)
@@ -412,7 +473,9 @@ async def test_assist_api_prompt(
     )
     hass.states.async_set(entry2.entity_id, "on", {"friendly_name": "Living Room"})
 
-    def create_entity(device: dr.DeviceEntry, write_state=True) -> None:
+    def create_entity(
+        device: dr.DeviceEntry, write_state=True, aliases: set[str] | None = None
+    ) -> None:
         """Create an entity for a device and track entity_id."""
         entity = entity_registry.async_get_or_create(
             "light",
@@ -422,6 +485,8 @@ async def test_assist_api_prompt(
             original_name=str(device.name or "Unnamed Device"),
             suggested_object_id=str(device.name or "unnamed_device"),
         )
+        if aliases:
+            entity_registry.async_update_entity(entity.entity_id, aliases=aliases)
         if write_state:
             entity.write_unavailable_state(hass)
 
@@ -433,7 +498,8 @@ async def test_assist_api_prompt(
             manufacturer="Test Manufacturer",
             model="Test Model",
             suggested_area="Test Area",
-        )
+        ),
+        aliases={"my test light"},
     )
     for i in range(3):
         create_entity(
@@ -506,74 +572,58 @@ async def test_assist_api_prompt(
             suggested_area="Test Area 2",
         )
     )
-
-    exposed_entities = llm._get_exposed_entities(hass, llm_context.assistant)
-    assert exposed_entities == {
-        "light.1": {
-            "areas": "Test Area 2",
-            "names": "1",
-            "state": "unavailable",
-        },
-        entry1.entity_id: {
-            "names": "Kitchen",
-            "state": "on",
-            "attributes": {"temperature": "0.9", "humidity": "65"},
-        },
-        entry2.entity_id: {
-            "areas": "Test Area, Alternative name",
-            "names": "Living Room",
-            "state": "on",
-        },
-        "light.test_device": {
-            "areas": "Test Area, Alternative name",
-            "names": "Test Device",
-            "state": "unavailable",
-        },
-        "light.test_device_2": {
-            "areas": "Test Area 2",
-            "names": "Test Device 2",
-            "state": "unavailable",
-        },
-        "light.test_device_3": {
-            "areas": "Test Area 2",
-            "names": "Test Device 3",
-            "state": "unavailable",
-        },
-        "light.test_device_4": {
-            "areas": "Test Area 2",
-            "names": "Test Device 4",
-            "state": "unavailable",
-        },
-        "light.test_service": {
-            "areas": "Test Area, Alternative name",
-            "names": "Test Service",
-            "state": "unavailable",
-        },
-        "light.test_service_2": {
-            "areas": "Test Area, Alternative name",
-            "names": "Test Service",
-            "state": "unavailable",
-        },
-        "light.test_service_3": {
-            "areas": "Test Area, Alternative name",
-            "names": "Test Service",
-            "state": "unavailable",
-        },
-        "light.unnamed_device": {
-            "areas": "Test Area 2",
-            "names": "Unnamed Device",
-            "state": "unavailable",
-        },
-    }
-    exposed_entities_prompt = (
-        "An overview of the areas and the devices in this smart home:\n"
-        + yaml.dump(exposed_entities)
-    )
+    exposed_entities_prompt = """An overview of the areas and the devices in this smart home:
+- names: Kitchen
+  domain: light
+  state: 'on'
+  attributes:
+    temperature: '0.9'
+    humidity: '65'
+- names: Living Room
+  domain: light
+  state: 'on'
+  areas: Test Area, Alternative name
+- names: Test Device, my test light
+  domain: light
+  state: unavailable
+  areas: Test Area, Alternative name
+- names: Test Service
+  domain: light
+  state: unavailable
+  areas: Test Area, Alternative name
+- names: Test Service
+  domain: light
+  state: unavailable
+  areas: Test Area, Alternative name
+- names: Test Service
+  domain: light
+  state: unavailable
+  areas: Test Area, Alternative name
+- names: Test Device 2
+  domain: light
+  state: unavailable
+  areas: Test Area 2
+- names: Test Device 3
+  domain: light
+  state: unavailable
+  areas: Test Area 2
+- names: Test Device 4
+  domain: light
+  state: unavailable
+  areas: Test Area 2
+- names: Unnamed Device
+  domain: light
+  state: unavailable
+  areas: Test Area 2
+- names: '1'
+  domain: light
+  state: unavailable
+  areas: Test Area 2
+"""
     first_part_prompt = (
         "When controlling Home Assistant always call the intent tools. "
         "Use HassTurnOn to lock and HassTurnOff to unlock a lock. "
-        "When controlling a device, prefer passing just its name and its domain "
-        "(what comes before the dot in its entity id). "
+        "When controlling a device, prefer passing just name and domain. "
         "When controlling an area, prefer passing just area name and domain."
     )
     no_timer_prompt = "This device is not able to start timers."
@@ -633,6 +683,7 @@ async def test_assist_api_prompt(
 
 async def test_script_tool(
     hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
     area_registry: ar.AreaRegistry,
     floor_registry: fr.FloorRegistry,
 ) -> None:
@@ -657,7 +708,10 @@ async def test_script_tool(
             "script": {
                 "test_script": {
                     "description": "This is a test script",
-                    "sequence": [],
+                    "sequence": [
+                        {"variables": {"result": {"drinks": 2}}},
+                        {"stop": True, "response_variable": "result"},
+                    ],
                     "fields": {
                         "beer": {"description": "Number of beers", "required": True},
                         "wine": {"selector": {"number": {"min": 0, "max": 3}}},
@@ -668,6 +722,10 @@ async def test_script_tool(
                         "extra_field": {"selector": {"area": {}}},
                     },
                 },
+                "script_with_no_fields": {
+                    "description": "This is another test script",
+                    "sequence": [],
+                },
                 "unexposed_script": {
                     "sequence": [],
                 },
@@ -675,6 +733,11 @@ async def test_script_tool(
         },
     )
     async_expose_entity(hass, "conversation", "script.test_script", True)
+    async_expose_entity(hass, "conversation", "script.script_with_no_fields", True)
+
+    entity_registry.async_update_entity(
+        "script.test_script", name="script name", aliases={"script alias"}
+    )
 
     area = area_registry.async_create("Living room")
     floor = floor_registry.async_create("2")
@@ -684,11 +747,14 @@ async def test_script_tool(
     api = await llm.async_get_api(hass, "assist", llm_context)
 
     tools = [tool for tool in api.tools if isinstance(tool, llm.ScriptTool)]
-    assert len(tools) == 1
+    assert len(tools) == 2
 
     tool = tools[0]
     assert tool.name == "test_script"
-    assert tool.description == "This is a test script"
+    assert (
+        tool.description
+        == "This is a test script. Aliases: ['script name', 'script alias']"
+    )
     schema = {
         vol.Required("beer", description="Number of beers"): cv.string,
         vol.Optional("wine"): selector.NumberSelector({"min": 0, "max": 3}),
@@ -701,9 +767,14 @@ async def test_script_tool(
     assert tool.parameters.schema == schema
 
     assert hass.data[llm.SCRIPT_PARAMETERS_CACHE] == {
-        "test_script": ("This is a test script", vol.Schema(schema))
+        "test_script": (
+            "This is a test script. Aliases: ['script name', 'script alias']",
+            vol.Schema(schema),
+        ),
+        "script_with_no_fields": ("This is another test script", vol.Schema({})),
     }
 
+    # Test script with response
     tool_input = llm.ToolInput(
         tool_name="test_script",
         tool_args={
@@ -716,26 +787,56 @@ async def test_script_tool(
         },
     )
 
-    with patch("homeassistant.core.ServiceRegistry.async_call") as mock_service_call:
+    with patch(
+        "homeassistant.core.ServiceRegistry.async_call",
+        side_effect=hass.services.async_call,
+    ) as mock_service_call:
         response = await api.async_call_tool(tool_input)
 
     mock_service_call.assert_awaited_once_with(
         "script",
-        "turn_on",
+        "test_script",
         {
-            "entity_id": "script.test_script",
-            "variables": {
-                "beer": "3",
-                "wine": 0,
-                "where": area.id,
-                "area_list": [area.id],
-                "floor": floor.floor_id,
-                "floor_list": [floor.floor_id],
-            },
+            "beer": "3",
+            "wine": 0,
+            "where": area.id,
+            "area_list": [area.id],
+            "floor": floor.floor_id,
+            "floor_list": [floor.floor_id],
         },
         context=context,
+        blocking=True,
+        return_response=True,
     )
-    assert response == {"success": True}
+    assert response == {
+        "success": True,
+        "result": {"drinks": 2},
+    }
+
+    # Test script with no response
+    tool_input = llm.ToolInput(
+        tool_name="script_with_no_fields",
+        tool_args={},
+    )
+
+    with patch(
+        "homeassistant.core.ServiceRegistry.async_call",
+        side_effect=hass.services.async_call,
+    ) as mock_service_call:
+        response = await api.async_call_tool(tool_input)
+
+    mock_service_call.assert_awaited_once_with(
+        "script",
+        "script_with_no_fields",
+        {},
+        context=context,
+        blocking=True,
+        return_response=True,
+    )
+    assert response == {
+        "success": True,
+        "result": {},
+    }
 
     # Test reload script with new parameters
     config = {
@@ -767,16 +868,23 @@ async def test_script_tool(
     api = await llm.async_get_api(hass, "assist", llm_context)
 
     tools = [tool for tool in api.tools if isinstance(tool, llm.ScriptTool)]
-    assert len(tools) == 1
+    assert len(tools) == 2
 
     tool = tools[0]
     assert tool.name == "test_script"
-    assert tool.description == "This is a new test script"
+    assert (
+        tool.description
+        == "This is a new test script. Aliases: ['script name', 'script alias']"
+    )
     schema = {vol.Required("beer", description="Number of beers"): cv.string}
     assert tool.parameters.schema == schema
 
     assert hass.data[llm.SCRIPT_PARAMETERS_CACHE] == {
-        "test_script": ("This is a new test script", vol.Schema(schema))
+        "test_script": (
+            "This is a new test script. Aliases: ['script name', 'script alias']",
+            vol.Schema(schema),
+        ),
+        "script_with_no_fields": ("This is another test script", vol.Schema({})),
     }
 
 
@@ -859,13 +967,22 @@ async def test_selector_serializer(
     assert selector_serializer(
         selector.ColorTempSelector({"min_mireds": 100, "max_mireds": 1000})
     ) == {"type": "number", "minimum": 100, "maximum": 1000}
+    assert selector_serializer(selector.ConditionSelector()) == {
+        "type": "array",
+        "items": {"nullable": True, "type": "string"},
+    }
     assert selector_serializer(selector.ConfigEntrySelector()) == {"type": "string"}
     assert selector_serializer(selector.ConstantSelector({"value": "test"})) == {
-        "enum": ["test"]
+        "type": "string",
+        "enum": ["test"],
     }
-    assert selector_serializer(selector.ConstantSelector({"value": 1})) == {"enum": [1]}
+    assert selector_serializer(selector.ConstantSelector({"value": 1})) == {
+        "type": "integer",
+        "enum": [1],
+    }
     assert selector_serializer(selector.ConstantSelector({"value": True})) == {
-        "enum": [True]
+        "type": "boolean",
+        "enum": [True],
     }
     assert selector_serializer(selector.QrCodeSelector({"data": "test"})) == {
         "type": "string"
@@ -892,6 +1009,17 @@ async def test_selector_serializer(
     assert selector_serializer(selector.DeviceSelector({"multiple": True})) == {
         "type": "array",
         "items": {"type": "string"},
+    }
+    assert selector_serializer(selector.DurationSelector()) == {
+        "type": "object",
+        "properties": {
+            "days": {"type": "number"},
+            "hours": {"type": "number"},
+            "minutes": {"type": "number"},
+            "seconds": {"type": "number"},
+            "milliseconds": {"type": "number"},
+        },
+        "required": [],
     }
     assert selector_serializer(selector.EntitySelector()) == {
         "type": "string",
@@ -946,7 +1074,10 @@ async def test_selector_serializer(
         "minimum": 30,
         "maximum": 100,
     }
-    assert selector_serializer(selector.ObjectSelector()) == {"type": "object"}
+    assert selector_serializer(selector.ObjectSelector()) == {
+        "type": "object",
+        "additionalProperties": True,
+    }
     assert selector_serializer(
         selector.SelectSelector(
             {
@@ -968,6 +1099,48 @@ async def test_selector_serializer(
     assert selector_serializer(
         selector.StateSelector({"entity_id": "sensor.test"})
     ) == {"type": "string"}
+    target_schema = selector_serializer(selector.TargetSelector())
+    target_schema["properties"]["entity_id"]["anyOf"][0][
+        "enum"
+    ].sort()  # Order is not deterministic
+    assert target_schema == {
+        "type": "object",
+        "properties": {
+            "area_id": {
+                "anyOf": [
+                    {"type": "string", "enum": ["none"]},
+                    {"type": "array", "items": {"type": "string", "nullable": True}},
+                ]
+            },
+            "device_id": {
+                "anyOf": [
+                    {"type": "string", "enum": ["none"]},
+                    {"type": "array", "items": {"type": "string", "nullable": True}},
+                ]
+            },
+            "entity_id": {
+                "anyOf": [
+                    {"type": "string", "enum": ["all", "none"], "format": "lower"},
+                    {"type": "string", "nullable": True},
+                    {"type": "array", "items": {"type": "string"}},
+                ]
+            },
+            "floor_id": {
+                "anyOf": [
+                    {"type": "string", "enum": ["none"]},
+                    {"type": "array", "items": {"type": "string", "nullable": True}},
+                ]
+            },
+            "label_id": {
+                "anyOf": [
+                    {"type": "string", "enum": ["none"]},
+                    {"type": "array", "items": {"type": "string", "nullable": True}},
+                ]
+            },
+        },
+        "required": [],
+    }
+
     assert selector_serializer(selector.TemplateSelector()) == {
         "type": "string",
         "format": "jinja2",

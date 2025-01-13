@@ -22,6 +22,8 @@ from .const import DOMAIN
 from .coordinator import InComfortDataCoordinator
 from .entity import IncomfortEntity
 
+PARALLEL_UPDATES = 1
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -46,7 +48,6 @@ class InComfortClimate(IncomfortEntity, ClimateEntity):
     _attr_hvac_modes = [HVACMode.HEAT]
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _enable_turn_on_off_backwards_compatibility = False
 
     def __init__(
         self,
@@ -90,8 +91,10 @@ class InComfortClimate(IncomfortEntity, ClimateEntity):
 
         As we set the override, we report back the override. The actual set point is
         is returned at a later time.
+        Some older thermostats return 0.0 as override, in that case we fallback to
+        the actual setpoint.
         """
-        return self._room.override
+        return self._room.override or self._room.setpoint
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set a new target temperature for this zone."""

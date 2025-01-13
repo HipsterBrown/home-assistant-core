@@ -111,6 +111,7 @@ UNSUBSCRIBE_COOLDOWN = 0.1
 TIMEOUT_ACK = 10
 RECONNECT_INTERVAL_SECONDS = 10
 
+MAX_WILDCARD_SUBSCRIBES_PER_CALL = 1
 MAX_SUBSCRIBES_PER_CALL = 500
 MAX_UNSUBSCRIBES_PER_CALL = 500
 
@@ -118,7 +119,7 @@ MAX_PACKETS_TO_READ = 500
 
 type SocketType = socket.socket | ssl.SSLSocket | mqtt.WebsocketWrapper | Any
 
-type SubscribePayloadType = str | bytes  # Only bytes if encoding is None
+type SubscribePayloadType = str | bytes | bytearray  # Only bytes if encoding is None
 
 
 def publish(
@@ -219,14 +220,13 @@ def async_subscribe_internal(
         mqtt_data = hass.data[DATA_MQTT]
     except KeyError as exc:
         raise HomeAssistantError(
-            f"Cannot subscribe to topic '{topic}', "
-            "make sure MQTT is set up correctly",
+            f"Cannot subscribe to topic '{topic}', make sure MQTT is set up correctly",
             translation_key="mqtt_not_setup_cannot_subscribe",
             translation_domain=DOMAIN,
             translation_placeholders={"topic": topic},
         ) from exc
     client = mqtt_data.client
-    if not client.connected and not mqtt_config_entry_enabled(hass):
+    if not mqtt_config_entry_enabled(hass):
         raise HomeAssistantError(
             f"Cannot subscribe to topic '{topic}', MQTT is not enabled",
             translation_key="mqtt_not_setup_cannot_subscribe",
@@ -375,7 +375,9 @@ class MQTT:
         self._simple_subscriptions: defaultdict[str, set[Subscription]] = defaultdict(
             set
         )
-        self._wildcard_subscriptions: set[Subscription] = set()
+        # To ensure the wildcard subscriptions order is preserved, we use a dict
+        # with `None` values instead of a set.
+        self._wildcard_subscriptions: dict[Subscription, None] = {}
         # _retained_topics prevents a Subscription from receiving a
         # retained message more than once per topic. This prevents flooding
         # already active subscribers when new subscribers subscribe to a topic
@@ -658,7 +660,7 @@ class MQTT:
                     self.conf.get(CONF_PORT, DEFAULT_PORT),
                     self.conf.get(CONF_KEEPALIVE, DEFAULT_KEEPALIVE),
                 )
-        except OSError as err:
+        except (OSError, mqtt.WebsocketConnectionError) as err:
             _LOGGER.error("Failed to connect to MQTT server due to exception: %s", err)
             self._async_connection_result(False)
         finally:
@@ -692,12 +694,15 @@ class MQTT:
 
     async def _reconnect_loop(self) -> None:
         """Reconnect to the MQTT server."""
+        # pylint: disable-next=import-outside-toplevel
+        import paho.mqtt.client as mqtt
+
         while True:
             if not self.connected:
                 try:
                     async with self._connection_lock, self._async_connect_in_executor():
                         await self.hass.async_add_executor_job(self._mqttc.reconnect)
-                except OSError as err:
+                except (OSError, mqtt.WebsocketConnectionError) as err:
                     _LOGGER.debug(
                         "Error re-connecting to MQTT server due to exception: %s", err
                     )
@@ -753,7 +758,7 @@ class MQTT:
         if subscription.is_simple_match:
             self._simple_subscriptions[subscription.topic].add(subscription)
         else:
-            self._wildcard_subscriptions.add(subscription)
+            self._wildcard_subscriptions[subscription] = None
 
     @callback
     def _async_untrack_subscription(self, subscription: Subscription) -> None:
@@ -771,9 +776,13 @@ class MQTT:
                 if not simple_subscriptions[topic]:
                     del simple_subscriptions[topic]
             else:
-                self._wildcard_subscriptions.remove(subscription)
+                del self._wildcard_subscriptions[subscription]
         except (KeyError, ValueError) as exc:
-            raise HomeAssistantError("Can't remove subscription twice") from exc
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="mqtt_not_setup_cannot_unsubscribe_twice",
+                translation_placeholders={"topic": topic},
+            ) from exc
 
     @callback
     def _async_queue_subscriptions(
@@ -819,7 +828,11 @@ class MQTT:
     ) -> Callable[[], None]:
         """Set up a subscription to a topic with the provided qos."""
         if not isinstance(topic, str):
-            raise HomeAssistantError("Topic needs to be a string!")
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="mqtt_topic_not_a_string",
+                translation_placeholders={"topic": topic},
+            )
 
         if job_type is None:
             job_type = get_hassjob_callable_job_type(msg_callback)
@@ -893,14 +906,27 @@ class MQTT:
         if not self._pending_subscriptions:
             return
 
-        subscriptions: dict[str, int] = self._pending_subscriptions
+        # Split out the wildcard subscriptions, we subscribe to them one by one
+        pending_subscriptions: dict[str, int] = self._pending_subscriptions
+        pending_wildcard_subscriptions = {
+            subscription.topic: pending_subscriptions.pop(subscription.topic)
+            for subscription in self._wildcard_subscriptions
+            if subscription.topic in pending_subscriptions
+        }
+
         self._pending_subscriptions = {}
 
-        subscription_list = list(subscriptions.items())
         debug_enabled = _LOGGER.isEnabledFor(logging.DEBUG)
 
-        for chunk in chunked_or_all(subscription_list, MAX_SUBSCRIBES_PER_CALL):
+        for chunk in chain(
+            chunked_or_all(
+                pending_wildcard_subscriptions.items(), MAX_WILDCARD_SUBSCRIBES_PER_CALL
+            ),
+            chunked_or_all(pending_subscriptions.items(), MAX_SUBSCRIBES_PER_CALL),
+        ):
             chunk_list = list(chunk)
+            if not chunk_list:
+                continue
 
             result, mid = self._mqttc.subscribe(chunk_list)
 
@@ -1197,7 +1223,11 @@ class MQTT:
             import paho.mqtt.client as mqtt
 
             raise HomeAssistantError(
-                f"Error talking to MQTT: {mqtt.error_string(result_code)}"
+                translation_domain=DOMAIN,
+                translation_key="mqtt_broker_error",
+                translation_placeholders={
+                    "error_message": mqtt.error_string(result_code)
+                },
             )
 
         # Create the mid event if not created, either _mqtt_handle_mid or

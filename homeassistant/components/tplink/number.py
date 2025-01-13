@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
-from typing import Final
+from typing import Final, cast
 
 from kasa import Device, Feature
 
@@ -26,10 +27,16 @@ from .entity import (
 _LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, kw_only=True)
 class TPLinkNumberEntityDescription(
     NumberEntityDescription, TPLinkFeatureEntityDescription
 ):
-    """Base class for a TPLink feature based sensor entity description."""
+    """Base class for a TPLink feature based number entity description."""
+
+
+# Coordinator is used to centralize the data updates
+# For actions the integration handles locking of concurrent device request
+PARALLEL_UPDATES = 0
 
 
 NUMBER_DESCRIPTIONS: Final = (
@@ -49,6 +56,14 @@ NUMBER_DESCRIPTIONS: Final = (
         key="temperature_offset",
         mode=NumberMode.BOX,
     ),
+    TPLinkNumberEntityDescription(
+        key="pan_step",
+        mode=NumberMode.BOX,
+    ),
+    TPLinkNumberEntityDescription(
+        key="tilt_step",
+        mode=NumberMode.BOX,
+    ),
 )
 
 NUMBER_DESCRIPTIONS_MAP = {desc.key: desc for desc in NUMBER_DESCRIPTIONS}
@@ -59,12 +74,13 @@ async def async_setup_entry(
     config_entry: TPLinkConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up sensors."""
+    """Set up number entities."""
     data = config_entry.runtime_data
     parent_coordinator = data.parent_coordinator
     children_coordinators = data.children_coordinators
     device = parent_coordinator.device
     entities = CoordinatedTPLinkFeatureEntity.entities_for_device_and_its_children(
+        hass=hass,
         device=device,
         coordinator=parent_coordinator,
         feature_type=Feature.Type.Number,
@@ -77,7 +93,7 @@ async def async_setup_entry(
 
 
 class TPLinkNumberEntity(CoordinatedTPLinkFeatureEntity, NumberEntity):
-    """Representation of a feature-based TPLink sensor."""
+    """Representation of a feature-based TPLink number entity."""
 
     entity_description: TPLinkNumberEntityDescription
 
@@ -90,7 +106,7 @@ class TPLinkNumberEntity(CoordinatedTPLinkFeatureEntity, NumberEntity):
         description: TPLinkFeatureEntityDescription,
         parent: Device | None = None,
     ) -> None:
-        """Initialize the a switch."""
+        """Initialize the number entity."""
         super().__init__(
             device, coordinator, feature=feature, description=description, parent=parent
         )
@@ -103,6 +119,7 @@ class TPLinkNumberEntity(CoordinatedTPLinkFeatureEntity, NumberEntity):
         await self._feature.set_value(int(value))
 
     @callback
-    def _async_update_attrs(self) -> None:
+    def _async_update_attrs(self) -> bool:
         """Update the entity's attributes."""
-        self._attr_native_value = self._feature.value
+        self._attr_native_value = cast(float | None, self._feature.value)
+        return True

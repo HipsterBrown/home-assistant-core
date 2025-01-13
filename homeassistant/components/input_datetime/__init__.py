@@ -176,14 +176,13 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     component.async_register_entity_service(
         "set_datetime",
         vol.All(
-            vol.Schema(
+            cv.make_entity_service_schema(
                 {
                     vol.Optional(ATTR_DATE): cv.date,
                     vol.Optional(ATTR_TIME): cv.time,
                     vol.Optional(ATTR_DATETIME): cv.datetime,
                     vol.Optional(ATTR_TIMESTAMP): vol.Coerce(float),
                 },
-                extra=vol.ALLOW_EXTRA,
             ),
             cv.has_at_least_one_key(
                 ATTR_DATE, ATTR_TIME, ATTR_DATETIME, ATTR_TIMESTAMP
@@ -386,7 +385,7 @@ class InputDatetime(collection.CollectionEntity, RestoreEntity):
     @callback
     def async_set_datetime(self, date=None, time=None, datetime=None, timestamp=None):
         """Set a new date / time."""
-        if timestamp:
+        if timestamp is not None:
             datetime = dt_util.as_local(dt_util.utc_from_timestamp(timestamp))
 
         if datetime:

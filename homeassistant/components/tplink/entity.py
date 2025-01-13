@@ -18,7 +18,7 @@ from kasa import (
 )
 
 from homeassistant.const import EntityCategory
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -36,6 +36,7 @@ from .const import (
     PRIMARY_STATE_ID,
 )
 from .coordinator import TPLinkDataUpdateCoordinator
+from .deprecate import DeprecatedInfo, async_check_create_deprecated
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -68,6 +69,10 @@ EXCLUDED_FEATURES = {
     # update
     "current_firmware_version",
     "available_firmware_version",
+    "update_available",
+    "check_latest_firmware",
+    # siren
+    "alarm",
 }
 
 
@@ -82,6 +87,17 @@ LEGACY_KEY_MAPPING = {
 @dataclass(frozen=True, kw_only=True)
 class TPLinkFeatureEntityDescription(EntityDescription):
     """Base class for a TPLink feature based entity description."""
+
+    deprecated_info: DeprecatedInfo | None = None
+    available_fn: Callable[[Device], bool] = lambda _: True
+
+
+@dataclass(frozen=True, kw_only=True)
+class TPLinkModuleEntityDescription(EntityDescription):
+    """Base class for a TPLink module based entity description."""
+
+    deprecated_info: DeprecatedInfo | None = None
+    available_fn: Callable[[Device], bool] = lambda _: True
 
 
 def async_refresh_after[_T: CoordinatedTPLinkEntity, **_P](
@@ -146,6 +162,9 @@ class CoordinatedTPLinkEntity(CoordinatorEntity[TPLinkDataUpdateCoordinator], AB
 
         registry_device = device
         device_name = get_device_name(device, parent=parent)
+        translation_key: str | None = None
+        translation_placeholders: Mapping[str, str] | None = None
+
         if parent and parent.device_type is not Device.Type.Hub:
             if not feature or feature.id == PRIMARY_STATE_ID:
                 # Entity will be added to parent if not a hub and no feature
@@ -153,6 +172,9 @@ class CoordinatedTPLinkEntity(CoordinatorEntity[TPLinkDataUpdateCoordinator], AB
                 # is the primary state
                 registry_device = parent
                 device_name = get_device_name(registry_device)
+                if not device_name:
+                    translation_key = "unnamed_device"
+                    translation_placeholders = {"model": parent.model}
             else:
                 # Prefix the device name with the parent name unless it is a
                 # hub attached device. Sensible default for child devices like
@@ -161,13 +183,28 @@ class CoordinatedTPLinkEntity(CoordinatorEntity[TPLinkDataUpdateCoordinator], AB
                 # Bedroom Ceiling Fan; Child device aliases will be Ceiling Fan
                 # and Dimmer Switch for both so should be distinguished by the
                 # parent name.
-                device_name = f"{get_device_name(parent)} {get_device_name(device, parent=parent)}"
+                parent_device_name = get_device_name(parent)
+                child_device_name = get_device_name(device, parent=parent)
+                if parent_device_name:
+                    device_name = f"{parent_device_name} {child_device_name}"
+                else:
+                    device_name = None
+                    translation_key = "unnamed_device"
+                    translation_placeholders = {
+                        "model": f"{parent.model} {child_device_name}"
+                    }
+
+        if device_name is None and not translation_key:
+            translation_key = "unnamed_device"
+            translation_placeholders = {"model": device.model}
 
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, str(registry_device.device_id))},
             manufacturer="TP-Link",
             model=registry_device.model,
             name=device_name,
+            translation_key=translation_key,
+            translation_placeholders=translation_placeholders,
             sw_version=registry_device.hw_info["sw_ver"],
             hw_version=registry_device.hw_info["hw_ver"],
         )
@@ -193,15 +230,18 @@ class CoordinatedTPLinkEntity(CoordinatorEntity[TPLinkDataUpdateCoordinator], AB
 
     @abstractmethod
     @callback
-    def _async_update_attrs(self) -> None:
-        """Platforms implement this to update the entity internals."""
+    def _async_update_attrs(self) -> bool:
+        """Platforms implement this to update the entity internals.
+
+        The return value is used to the set the entity available attribute.
+        """
         raise NotImplementedError
 
     @callback
     def _async_call_update_attrs(self) -> None:
         """Call update_attrs and make entity unavailable on errors."""
         try:
-            self._async_update_attrs()
+            available = self._async_update_attrs()
         except Exception as ex:  # noqa: BLE001
             if self._attr_available:
                 _LOGGER.warning(
@@ -212,7 +252,7 @@ class CoordinatedTPLinkEntity(CoordinatorEntity[TPLinkDataUpdateCoordinator], AB
                 )
             self._attr_available = False
         else:
-            self._attr_available = True
+            self._attr_available = available
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -247,18 +287,25 @@ class CoordinatedTPLinkFeatureEntity(CoordinatedTPLinkEntity, ABC):
 
     def _get_unique_id(self) -> str:
         """Return unique ID for the entity."""
-        key = self.entity_description.key
+        return self._get_feature_unique_id(self._device, self.entity_description)
+
+    @staticmethod
+    def _get_feature_unique_id(
+        device: Device, entity_description: TPLinkFeatureEntityDescription
+    ) -> str:
+        """Return unique ID for the entity."""
+        key = entity_description.key
         # The unique id for the state feature in the switch platform is the
         # device_id
         if key == PRIMARY_STATE_ID:
-            return legacy_device_id(self._device)
+            return legacy_device_id(device)
 
         # Historically the legacy device emeter attributes which are now
         # replaced with features used slightly different keys. This ensures
         # that those entities are not orphaned. Returns the mapped key or the
         # provided key if not mapped.
         key = LEGACY_KEY_MAPPING.get(key, key)
-        return f"{legacy_device_id(self._device)}_{key}"
+        return f"{legacy_device_id(device)}_{key}"
 
     @classmethod
     def _category_for_feature(cls, feature: Feature | None) -> EntityCategory | None:
@@ -294,6 +341,7 @@ class CoordinatedTPLinkFeatureEntity(CoordinatedTPLinkEntity, ABC):
 
         if descriptions and (desc := descriptions.get(feature.id)):
             translation_key: str | None = feature.id
+
             # HA logic is to name entities based on the following logic:
             # _attr_name > translation.name > description.name
             # > device_class (if base platform supports).
@@ -317,7 +365,7 @@ class CoordinatedTPLinkFeatureEntity(CoordinatedTPLinkEntity, ABC):
                 and desc.entity_registry_enabled_default,
             )
 
-        _LOGGER.info(
+        _LOGGER.debug(
             "Device feature: %s (%s) needs an entity description defined in HA",
             feature.name,
             feature.id,
@@ -330,6 +378,7 @@ class CoordinatedTPLinkFeatureEntity(CoordinatedTPLinkEntity, ABC):
         _D: TPLinkFeatureEntityDescription,
     ](
         cls,
+        hass: HomeAssistant,
         device: Device,
         coordinator: TPLinkDataUpdateCoordinator,
         *,
@@ -364,6 +413,11 @@ class CoordinatedTPLinkFeatureEntity(CoordinatedTPLinkEntity, ABC):
                     feat, descriptions, device=device, parent=parent
                 )
             )
+            and async_check_create_deprecated(
+                hass,
+                cls._get_feature_unique_id(device, desc),
+                desc,
+            )
         ]
         return entities
 
@@ -373,6 +427,7 @@ class CoordinatedTPLinkFeatureEntity(CoordinatedTPLinkEntity, ABC):
         _D: TPLinkFeatureEntityDescription,
     ](
         cls,
+        hass: HomeAssistant,
         device: Device,
         coordinator: TPLinkDataUpdateCoordinator,
         *,
@@ -389,6 +444,7 @@ class CoordinatedTPLinkFeatureEntity(CoordinatedTPLinkEntity, ABC):
         # Add parent entities before children so via_device id works.
         entities.extend(
             cls._entities_for_device(
+                hass,
                 device,
                 coordinator=coordinator,
                 feature_type=feature_type,
@@ -408,6 +464,7 @@ class CoordinatedTPLinkFeatureEntity(CoordinatedTPLinkEntity, ABC):
                     child_coordinator = coordinator
                 entities.extend(
                     cls._entities_for_device(
+                        hass,
                         child,
                         coordinator=child_coordinator,
                         feature_type=feature_type,
